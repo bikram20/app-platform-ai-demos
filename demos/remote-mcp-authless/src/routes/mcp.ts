@@ -5,95 +5,166 @@ const mcpServer = new CalculatorMCPServer();
 
 export async function handleMCP(req: Request, res: Response) {
 	try {
-		// Handle MCP protocol requests
-		// This is a simplified handler - in practice, you'd need to implement
-		// the full MCP protocol handling here
+		const { method, params, id, jsonrpc } = req.body;
 		
-		const { method, params } = req.body;
+		console.error(`[MCP] Received method: ${method}`);
 		
-		if (method === "tools/list") {
-			// Return available tools
-			res.json({
-				tools: [
-					{
-						name: "add",
-						description: "Add two numbers",
-						inputSchema: {
-							type: "object",
-							properties: {
-								a: { type: "number" },
-								b: { type: "number" }
-							},
-							required: ["a", "b"]
-						}
-					},
-					{
-						name: "calculate",
-						description: "Perform basic arithmetic operations",
-						inputSchema: {
-							type: "object",
-							properties: {
-								operation: { 
-									type: "string", 
-									enum: ["add", "subtract", "multiply", "divide"] 
-								},
-								a: { type: "number" },
-								b: { type: "number" }
-							},
-							required: ["operation", "a", "b"]
+		// Handle different MCP methods
+		switch (method) {
+			case "initialize":
+				res.json({
+					jsonrpc: "2.0",
+					id,
+					result: {
+						protocolVersion: "2024-11-05",
+						capabilities: {
+							tools: {}
+						},
+						serverInfo: {
+							name: "calculator-server",
+							version: "1.0.0"
 						}
 					}
-				]
-			});
-		} else if (method === "tools/call") {
-			// Call a tool
-			const { name, arguments: args } = params;
-			
-			// This is a basic implementation - the MCP SDK would normally handle this
-			if (name === "add") {
-				const result = args.a + args.b;
-				res.json({
-					content: [{ type: "text", text: String(result) }]
 				});
-			} else if (name === "calculate") {
-				const { operation, a, b } = args;
-				let result: number;
+				break;
 				
-				switch (operation) {
-					case "add":
-						result = a + b;
-						break;
-					case "subtract":
-						result = a - b;
-						break;
-					case "multiply":
-						result = a * b;
-						break;
-					case "divide":
-						if (b === 0) {
+			case "initialized":
+				// Client confirms initialization
+				res.json({
+					jsonrpc: "2.0",
+					id,
+					result: {}
+				});
+				break;
+				
+			case "tools/list":
+				res.json({
+					jsonrpc: "2.0",
+					id,
+					result: {
+						tools: [
+							{
+								name: "add",
+								description: "Add two numbers",
+								inputSchema: {
+									type: "object",
+									properties: {
+										a: { type: "number" },
+										b: { type: "number" }
+									},
+									required: ["a", "b"]
+								}
+							},
+							{
+								name: "calculate",
+								description: "Perform basic arithmetic operations",
+								inputSchema: {
+									type: "object",
+									properties: {
+										operation: { 
+											type: "string", 
+											enum: ["add", "subtract", "multiply", "divide"] 
+										},
+										a: { type: "number" },
+										b: { type: "number" }
+									},
+									required: ["operation", "a", "b"]
+								}
+							}
+						]
+					}
+				});
+				break;
+				
+			case "tools/call":
+				const { name, arguments: args } = params;
+				
+				if (name === "add") {
+					const result = args.a + args.b;
+					res.json({
+						jsonrpc: "2.0",
+						id,
+						result: {
+							content: [{ type: "text", text: String(result) }]
+						}
+					});
+				} else if (name === "calculate") {
+					const { operation, a, b } = args;
+					let result: number;
+					
+					switch (operation) {
+						case "add":
+							result = a + b;
+							break;
+						case "subtract":
+							result = a - b;
+							break;
+						case "multiply":
+							result = a * b;
+							break;
+						case "divide":
+							if (b === 0) {
+								res.json({
+									jsonrpc: "2.0",
+									id,
+									result: {
+										content: [{ type: "text", text: "Error: Cannot divide by zero" }]
+									}
+								});
+								return;
+							}
+							result = a / b;
+							break;
+						default:
 							res.json({
-								content: [{ type: "text", text: "Error: Cannot divide by zero" }]
+								jsonrpc: "2.0",
+								id,
+								error: {
+									code: -32602,
+									message: "Unknown operation"
+								}
 							});
 							return;
+					}
+					
+					res.json({
+						jsonrpc: "2.0",
+						id,
+						result: {
+							content: [{ type: "text", text: String(result) }]
 						}
-						result = a / b;
-						break;
-					default:
-						res.status(400).json({ error: "Unknown operation" });
-						return;
+					});
+				} else {
+					res.json({
+						jsonrpc: "2.0",
+						id,
+						error: {
+							code: -32602,
+							message: "Unknown tool"
+						}
+					});
 				}
+				break;
 				
+			default:
 				res.json({
-					content: [{ type: "text", text: String(result) }]
+					jsonrpc: "2.0",
+					id,
+					error: {
+						code: -32601,
+						message: "Unknown method"
+					}
 				});
-			} else {
-				res.status(400).json({ error: "Unknown tool" });
-			}
-		} else {
-			res.status(400).json({ error: "Unknown method" });
 		}
 	} catch (error) {
 		console.error("MCP error:", error);
-		res.status(500).json({ error: "Internal server error" });
+		res.status(500).json({
+			jsonrpc: "2.0",
+			id: req.body.id || null,
+			error: {
+				code: -32603,
+				message: "Internal server error"
+			}
+		});
 	}
-} 
+}
