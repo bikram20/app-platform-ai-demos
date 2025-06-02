@@ -3,13 +3,19 @@ import { CalculatorMCPServer } from "../mcp-server.js";
 
 const mcpServer = new CalculatorMCPServer();
 
-// In-memory storage for active SSE connections
-const activeConnections = new Map<string, Response>();
-let connectionCounter = 0;
+// Store active SSE connections
+interface SSEConnection {
+	id: string;
+	res: Response;
+	sendMessage: (message: any) => void;
+}
+
+const connections = new Map<string, SSEConnection>();
+let connectionIdCounter = 0;
 
 export async function handleSSE(req: Request, res: Response) {
-	// Generate unique connection ID
-	const connectionId = `conn_${++connectionCounter}_${Date.now()}`;
+	const connectionId = `conn_${++connectionIdCounter}`;
+	console.error(`[SSE] New connection: ${connectionId}`);
 	
 	// Set SSE headers
 	res.writeHead(200, {
@@ -17,194 +23,216 @@ export async function handleSSE(req: Request, res: Response) {
 		"Cache-Control": "no-cache",
 		"Connection": "keep-alive",
 		"Access-Control-Allow-Origin": "*",
-		"Access-Control-Allow-Headers": "Content-Type",
+		"X-Accel-Buffering": "no", // Disable nginx buffering
 	});
 
-	// Store this connection
-	activeConnections.set(connectionId, res);
-	
-	// Send connection established message with connection ID
-	res.write(`data: ${JSON.stringify({
-		type: "connection",
-		status: "connected",
-		connectionId: connectionId,
-		message: "MCP Calculator Server connected. Send tool calls to /sse/message with your connectionId."
-	})}\n\n`);
+	// Helper to send SSE messages
+	const sendMessage = (message: any) => {
+		res.write(`data: ${JSON.stringify(message)}\n\n`);
+	};
 
-	// Keep alive with periodic pings
-	const keepAlive = setInterval(() => {
-		if (activeConnections.has(connectionId)) {
-			res.write(`data: ${JSON.stringify({
-				type: "ping",
-				timestamp: new Date().toISOString()
-			})}\n\n`);
+	// Store connection
+	const connection: SSEConnection = {
+		id: connectionId,
+		res,
+		sendMessage
+	};
+	connections.set(connectionId, connection);
+
+	// Send initial connection message
+	sendMessage({
+		type: "connection",
+		connectionId,
+		message: "Connected to MCP Calculator Server"
+	});
+
+	// Keep-alive ping
+	const pingInterval = setInterval(() => {
+		if (connections.has(connectionId)) {
+			sendMessage({ type: "ping" });
 		}
 	}, 30000);
 
-	// Handle client disconnection
-	const cleanup = () => {
-		clearInterval(keepAlive);
-		activeConnections.delete(connectionId);
-		console.log(`SSE connection ${connectionId} closed`);
-	};
-
-	req.on("close", cleanup);
-	req.on("aborted", cleanup);
-	
-	console.log(`SSE connection ${connectionId} established`);
+	// Handle disconnection
+	req.on("close", () => {
+		console.error(`[SSE] Connection closed: ${connectionId}`);
+		clearInterval(pingInterval);
+		connections.delete(connectionId);
+	});
 }
 
 export async function handleSSEMessage(req: Request, res: Response) {
 	try {
-		const { method, params, connectionId } = req.body;
+		const { connectionId, ...message } = req.body;
+		console.error(`[SSE Message] From ${connectionId}:`, JSON.stringify(message));
 		
-		// If no connectionId provided, try to send to the most recent connection
-		let targetConnectionId = connectionId;
-		if (!targetConnectionId && activeConnections.size > 0) {
-			// Use the most recent connection
-			targetConnectionId = Array.from(activeConnections.keys()).pop();
-		}
+		// Find the connection
+		const targetId = connectionId || Array.from(connections.keys()).pop();
+		const connection = connections.get(targetId!);
 		
-		if (!targetConnectionId || !activeConnections.has(targetConnectionId)) {
+		if (!connection) {
 			return res.status(400).json({ 
-				error: "No active SSE connection found. Connect to /sse first." 
+				error: "No active SSE connection found" 
 			});
 		}
+
+		// Handle MCP protocol messages
+		const { method, params, id, jsonrpc } = message;
 		
-		const sseResponse = activeConnections.get(targetConnectionId)!;
-		
-		// Process MCP tool calls
-		if (method === "tools/list") {
-			const result = {
-				type: "response",
-				id: `req_${Date.now()}`,
-				result: {
-					tools: [
-						{
-							name: "add",
-							description: "Add two numbers",
-							inputSchema: {
-								type: "object",
-								properties: {
-									a: { type: "number" },
-									b: { type: "number" }
-								},
-								required: ["a", "b"]
-							}
-						},
-						{
-							name: "calculate",
-							description: "Perform basic arithmetic operations",
-							inputSchema: {
-								type: "object",
-								properties: {
-									operation: { 
-										type: "string", 
-										enum: ["add", "subtract", "multiply", "divide"] 
-									},
-									a: { type: "number" },
-									b: { type: "number" }
-								},
-								required: ["operation", "a", "b"]
-							}
-						}
-					]
-				}
-			};
-			
-			sseResponse.write(`data: ${JSON.stringify(result)}\n\n`);
-			res.json({ status: "tools list sent via SSE" });
-			
-		} else if (method === "tools/call") {
-			const { name, arguments: args } = params;
-			let result;
-			
-			if (name === "add") {
-				const sum = args.a + args.b;
-				result = {
-					type: "response",
-					id: `req_${Date.now()}`,
+		switch (method) {
+			case "initialize":
+				connection.sendMessage({
+					jsonrpc: "2.0",
+					id,
 					result: {
-						content: [{ type: "text", text: String(sum) }]
+						protocolVersion: "2024-11-05",
+						capabilities: {
+							tools: {},
+							logging: {}
+						},
+						serverInfo: {
+							name: "calculator-server",
+							version: "1.0.0"
+						}
 					}
-				};
-			} else if (name === "calculate") {
-				const { operation, a, b } = args;
-				let calcResult: number | undefined;
+				});
+				break;
 				
-				switch (operation) {
-					case "add":
-						calcResult = a + b;
-						break;
-					case "subtract":
-						calcResult = a - b;
-						break;
-					case "multiply":
-						calcResult = a * b;
-						break;
-					case "divide":
-						if (b === 0) {
-							result = {
-								type: "response",
-								id: `req_${Date.now()}`,
-								result: {
-									content: [{ type: "text", text: "Error: Cannot divide by zero" }]
+			case "initialized":
+				// Client confirms initialization
+				connection.sendMessage({
+					jsonrpc: "2.0",
+					id,
+					result: {}
+				});
+				break;
+				
+			case "tools/list":
+				connection.sendMessage({
+					jsonrpc: "2.0",
+					id,
+					result: {
+						tools: [
+							{
+								name: "add",
+								description: "Add two numbers",
+								inputSchema: {
+									type: "object",
+									properties: {
+										a: { type: "number" },
+										b: { type: "number" }
+									},
+									required: ["a", "b"]
 								}
-							};
-							break;
-						}
-						calcResult = a / b;
-						break;
-					default:
-						result = {
-							type: "error",
-							id: `req_${Date.now()}`,
-							error: { message: "Unknown operation" }
-						};
-						break;
-				}
+							},
+							{
+								name: "calculate",
+								description: "Perform basic arithmetic operations",
+								inputSchema: {
+									type: "object",
+									properties: {
+										operation: { 
+											type: "string", 
+											enum: ["add", "subtract", "multiply", "divide"] 
+										},
+										a: { type: "number" },
+										b: { type: "number" }
+									},
+									required: ["operation", "a", "b"]
+								}
+							}
+						]
+					}
+				});
+				break;
 				
-				if (!result && calcResult !== undefined) {
-					result = {
-						type: "response",
-						id: `req_${Date.now()}`,
+			case "tools/call":
+				const { name, arguments: args } = params;
+				
+				if (name === "add") {
+					const result = args.a + args.b;
+					connection.sendMessage({
+						jsonrpc: "2.0",
+						id,
 						result: {
-							content: [{ type: "text", text: String(calcResult) }]
+							content: [{ type: "text", text: String(result) }]
 						}
-					};
+					});
+				} else if (name === "calculate") {
+					const { operation, a, b } = args;
+					let result: number;
+					
+					switch (operation) {
+						case "add":
+							result = a + b;
+							break;
+						case "subtract":
+							result = a - b;
+							break;
+						case "multiply":
+							result = a * b;
+							break;
+						case "divide":
+							if (b === 0) {
+								connection.sendMessage({
+									jsonrpc: "2.0",
+									id,
+									result: {
+										content: [{ type: "text", text: "Error: Cannot divide by zero" }]
+									}
+								});
+								res.json({ status: "sent" });
+								return;
+							}
+							result = a / b;
+							break;
+						default:
+							connection.sendMessage({
+								jsonrpc: "2.0",
+								id,
+								error: {
+									code: -32602,
+									message: "Unknown operation"
+								}
+							});
+							res.json({ status: "sent" });
+							return;
+					}
+					
+					connection.sendMessage({
+						jsonrpc: "2.0",
+						id,
+						result: {
+							content: [{ type: "text", text: String(result) }]
+						}
+					});
+				} else {
+					connection.sendMessage({
+						jsonrpc: "2.0",
+						id,
+						error: {
+							code: -32602,
+							message: "Unknown tool"
+						}
+					});
 				}
-			} else {
-				result = {
-					type: "error",
-					id: `req_${Date.now()}`,
-					error: { message: "Unknown tool" }
-				};
-			}
-			
-			sseResponse.write(`data: ${JSON.stringify(result)}\n\n`);
-			res.json({ status: "tool call result sent via SSE" });
-			
-		} else {
-			const errorResult = {
-				type: "error",
-				id: `req_${Date.now()}`,
-				error: { message: "Unknown method" }
-			};
-			
-			sseResponse.write(`data: ${JSON.stringify(errorResult)}\n\n`);
-			res.json({ status: "error sent via SSE" });
+				break;
+				
+			default:
+				connection.sendMessage({
+					jsonrpc: "2.0",
+					id,
+					error: {
+						code: -32601,
+						message: "Unknown method"
+					}
+				});
 		}
+		
+		res.json({ status: "message sent" });
 		
 	} catch (error) {
 		console.error("SSE message error:", error);
 		res.status(500).json({ error: "Internal server error" });
 	}
 }
-
-// Helper function to get connection status (useful for debugging)
-export function getConnectionStatus() {
-	return {
-		activeConnections: activeConnections.size,
-		connectionIds: Array.from(activeConnections.keys())
-	};
-} 
