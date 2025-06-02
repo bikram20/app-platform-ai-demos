@@ -26,7 +26,8 @@ app.get("/", (req, res) => {
 app.post("/mcp", handleMCP);
 
 // SSE endpoints
-app.get("/sse", handleSSE);
+app.get("/sse", handleSSE);    // For SSE connections
+app.post("/sse", handleSSE);   // For HTTP-first strategy (THIS WAS MISSING!)
 app.post("/sse/message", handleSSEMessage);
 
 // 404 handler

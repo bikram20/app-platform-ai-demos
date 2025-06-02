@@ -13,7 +13,14 @@ interface SSEConnection {
 const connections = new Map<string, SSEConnection>();
 let connectionIdCounter = 0;
 
+// Handle both GET (SSE) and POST (HTTP) requests
 export async function handleSSE(req: Request, res: Response) {
+	// Handle POST requests (HTTP transport)
+	if (req.method === 'POST') {
+		return handleHTTPRequest(req, res);
+	}
+	
+	// Handle GET requests (SSE transport)
 	const connectionId = `conn_${++connectionIdCounter}`;
 	console.error(`[SSE] New connection: ${connectionId}`);
 	
@@ -28,7 +35,8 @@ export async function handleSSE(req: Request, res: Response) {
 
 	// Helper to send SSE messages
 	const sendMessage = (message: any) => {
-		res.write(`data: ${JSON.stringify(message)}\n\n`);
+		const data = JSON.stringify(message);
+		res.write(`data: ${data}\n\n`);
 	};
 
 	// Store connection
@@ -39,17 +47,10 @@ export async function handleSSE(req: Request, res: Response) {
 	};
 	connections.set(connectionId, connection);
 
-	// Send initial connection message
-	sendMessage({
-		type: "connection",
-		connectionId,
-		message: "Connected to MCP Calculator Server"
-	});
-
 	// Keep-alive ping
 	const pingInterval = setInterval(() => {
 		if (connections.has(connectionId)) {
-			sendMessage({ type: "ping" });
+			res.write(`:ping\n\n`); // SSE comment for keep-alive
 		}
 	}, 30000);
 
@@ -59,6 +60,171 @@ export async function handleSSE(req: Request, res: Response) {
 		clearInterval(pingInterval);
 		connections.delete(connectionId);
 	});
+}
+
+// Handle HTTP POST requests (for http-first strategy)
+async function handleHTTPRequest(req: Request, res: Response) {
+	try {
+		const { method, params, id, jsonrpc } = req.body;
+		console.error(`[HTTP] Received method: ${method}`);
+		
+		switch (method) {
+			case "initialize":
+				res.json({
+					jsonrpc: "2.0",
+					id,
+					result: {
+						protocolVersion: "2024-11-05",
+						capabilities: {
+							tools: {},
+							logging: {}
+						},
+						serverInfo: {
+							name: "calculator-server",
+							version: "1.0.0"
+						}
+					}
+				});
+				break;
+				
+			case "initialized":
+				res.json({
+					jsonrpc: "2.0",
+					id,
+					result: {}
+				});
+				break;
+				
+			case "tools/list":
+				res.json({
+					jsonrpc: "2.0",
+					id,
+					result: {
+						tools: [
+							{
+								name: "add",
+								description: "Add two numbers",
+								inputSchema: {
+									type: "object",
+									properties: {
+										a: { type: "number" },
+										b: { type: "number" }
+									},
+									required: ["a", "b"]
+								}
+							},
+							{
+								name: "calculate",
+								description: "Perform basic arithmetic operations",
+								inputSchema: {
+									type: "object",
+									properties: {
+										operation: { 
+											type: "string", 
+											enum: ["add", "subtract", "multiply", "divide"] 
+										},
+										a: { type: "number" },
+										b: { type: "number" }
+									},
+									required: ["operation", "a", "b"]
+								}
+							}
+						]
+					}
+				});
+				break;
+				
+			case "tools/call":
+				const { name, arguments: args } = params;
+				
+				if (name === "add") {
+					const result = args.a + args.b;
+					res.json({
+						jsonrpc: "2.0",
+						id,
+						result: {
+							content: [{ type: "text", text: String(result) }]
+						}
+					});
+				} else if (name === "calculate") {
+					const { operation, a, b } = args;
+					let result: number;
+					
+					switch (operation) {
+						case "add":
+							result = a + b;
+							break;
+						case "subtract":
+							result = a - b;
+							break;
+						case "multiply":
+							result = a * b;
+							break;
+						case "divide":
+							if (b === 0) {
+								res.json({
+									jsonrpc: "2.0",
+									id,
+									result: {
+										content: [{ type: "text", text: "Error: Cannot divide by zero" }]
+									}
+								});
+								return;
+							}
+							result = a / b;
+							break;
+						default:
+							res.json({
+								jsonrpc: "2.0",
+								id,
+								error: {
+									code: -32602,
+									message: "Unknown operation"
+								}
+							});
+							return;
+					}
+					
+					res.json({
+						jsonrpc: "2.0",
+						id,
+						result: {
+							content: [{ type: "text", text: String(result) }]
+						}
+					});
+				} else {
+					res.json({
+						jsonrpc: "2.0",
+						id,
+						error: {
+							code: -32602,
+							message: "Unknown tool"
+						}
+					});
+				}
+				break;
+				
+			default:
+				res.json({
+					jsonrpc: "2.0",
+					id,
+					error: {
+						code: -32601,
+						message: "Unknown method"
+					}
+				});
+		}
+	} catch (error) {
+		console.error("HTTP error:", error);
+		res.status(500).json({
+			jsonrpc: "2.0",
+			id: req.body.id || null,
+			error: {
+				code: -32603,
+				message: "Internal server error"
+			}
+		});
+	}
 }
 
 export async function handleSSEMessage(req: Request, res: Response) {
@@ -99,7 +265,6 @@ export async function handleSSEMessage(req: Request, res: Response) {
 				break;
 				
 			case "initialized":
-				// Client confirms initialization
 				connection.sendMessage({
 					jsonrpc: "2.0",
 					id,
