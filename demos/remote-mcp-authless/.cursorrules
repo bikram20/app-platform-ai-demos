@@ -1,0 +1,286 @@
+# Cloudflare Workers to DigitalOcean App Platform Migration Rules
+
+## Core Migration Principles
+
+### 1. Architecture Decision Framework
+- **Start Fresh vs Migrate**: For simple business logic (<100 lines), prefer rewriting over migrating
+- **Evaluate Cloudflare-specific features**: Durable Objects, KV Storage, R2 require alternative solutions
+- **Modular Structure**: Separate concerns (server, routes, business logic) for better maintainability
+
+### 2. Entry Point Transformation
+**FROM (Cloudflare Workers):**
+```typescript
+export default {
+  fetch(request: Request, env: Env, ctx: ExecutionContext) {
+    // Workers fetch handler
+  }
+}
+```
+
+**TO (Node.js Express):**
+```typescript
+import express from "express";
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
+```
+
+### 3. Request/Response Handling
+**Workers → Express Mapping:**
+- `Request` object → `req: Request` (Express)
+- `Response` object → `res: Response` (Express)
+- `new Response()` → `res.json()` or `res.send()`
+- `request.json()` → `req.body` (with express.json() middleware)
+
+### 4. Package.json Migration Pattern
+**Remove:**
+- `wrangler` (CLI and types)
+- `@cloudflare/workers-types`
+- Cloudflare-specific dependencies
+
+**Add:**
+- `express`, `@types/express`
+- `cors`, `@types/cors`
+- `@types/node`
+- `tsx` (for development)
+
+**Scripts Pattern:**
+```json
+{
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "type-check": "tsc --noEmit"
+  }
+}
+```
+
+### 5. TypeScript Configuration
+**Key Changes:**
+```json
+{
+  "compilerOptions": {
+    "module": "commonjs",           // Was: "es2022"
+    "moduleResolution": "node",     // Was: "Bundler"
+    "outDir": "./dist",            // Was: "noEmit": true
+    "rootDir": "./src",
+    "esModuleInterop": true,
+    "types": ["node"]              // Add Node.js types
+  }
+}
+```
+
+## Cloudflare-Specific Feature Migrations
+
+### 1. Durable Objects → Stateless Architecture
+**Strategy**: Prefer stateless design with in-memory session management
+```typescript
+// Cloudflare (Durable Objects)
+export class MyDO extends DurableObject { }
+
+// Node.js (In-memory)
+const activeConnections = new Map<string, Response>();
+let connectionCounter = 0;
+```
+
+### 2. Environment Variables
+**From**: `wrangler.jsonc` bindings
+**To**: `.env` files and `process.env`
+```typescript
+// Workers
+const value = env.MY_SECRET;
+
+// Node.js
+const value = process.env.MY_SECRET;
+```
+
+### 3. SSE Implementation Pattern
+**Key Requirements:**
+- Use `Content-Type: text/event-stream` header
+- Implement `res.write()` for streaming
+- Maintain connection map for bidirectional communication
+- Handle cleanup on disconnect
+
+```typescript
+// SSE Headers Pattern
+res.writeHead(200, {
+  "Content-Type": "text/event-stream",
+  "Cache-Control": "no-cache", 
+  "Connection": "keep-alive",
+  "Access-Control-Allow-Origin": "*"
+});
+```
+
+## Project Structure Best Practices
+
+### Recommended Structure
+```
+src/
+├── index.ts          # Express server entry point
+├── server.ts         # Business logic (extracted from Workers)
+├── routes/
+│   ├── api.ts        # Direct HTTP endpoints
+│   └── sse.ts        # Server-Sent Events
+└── types/
+    └── index.ts      # Shared TypeScript types
+```
+
+### File Responsibilities
+- **index.ts**: Express setup, middleware, routing
+- **server.ts**: Core business logic, tool definitions
+- **routes/**: HTTP handlers, protocol implementations
+- **types/**: TypeScript definitions
+
+## Common Migration Patterns
+
+### 1. URL Routing
+**Workers Pattern:**
+```typescript
+const url = new URL(request.url);
+if (url.pathname === "/api") { }
+```
+
+**Express Pattern:**
+```typescript
+app.post("/api", (req, res) => { });
+app.get("/sse", (req, res) => { });
+```
+
+### 2. Error Handling
+**Workers:**
+```typescript
+return new Response("Error", { status: 500 });
+```
+
+**Express:**
+```typescript
+res.status(500).json({ error: "Error message" });
+```
+
+### 3. CORS Handling
+**Workers**: Manual CORS headers
+**Express**: Use `cors` middleware
+```typescript
+import cors from "cors";
+app.use(cors());
+```
+
+## DigitalOcean App Platform Specifics
+
+### 1. Environment Variables
+- `PORT` is automatically provided
+- Configure custom variables in App Platform console
+- Use `env.example` for local development template
+
+### 2. Build Configuration
+**App Platform expects:**
+- **Build Command**: `npm run build`
+- **Run Command**: `npm start`
+- Node.js buildpack (automatic detection)
+
+### 3. Health Checks
+Always implement a health endpoint:
+```typescript
+app.get("/", (req, res) => {
+  res.json({ 
+    message: "Server is running",
+    endpoints: { /* list endpoints */ }
+  });
+});
+```
+
+## Testing Strategy
+
+### 1. Dual Protocol Testing
+Test both HTTP and SSE endpoints:
+```bash
+# Direct HTTP
+curl -X POST http://localhost:3000/api
+
+# SSE (two terminals)
+curl -N http://localhost:3000/sse  # Terminal 1
+curl -X POST http://localhost:3000/sse/message  # Terminal 2
+```
+
+### 2. Port Conflict Resolution
+Use `PORT=8080 npm run dev` if default port is occupied
+
+## Migration Checklist
+
+### Pre-Migration Assessment
+- [ ] Identify Cloudflare-specific features used
+- [ ] Evaluate business logic complexity
+- [ ] Plan state management strategy
+- [ ] Review environment variables
+
+### Migration Steps
+- [ ] Backup original code (`*.cloudflare.bak`)
+- [ ] Update package.json dependencies
+- [ ] Configure TypeScript for Node.js
+- [ ] Implement Express server structure
+- [ ] Extract and port business logic
+- [ ] Implement SSE if needed
+- [ ] Create environment template
+- [ ] Update README with deployment instructions
+- [ ] Test all endpoints thoroughly
+
+### Post-Migration Validation
+- [ ] Health endpoint responds correctly
+- [ ] All business logic functions work
+- [ ] SSE streaming works (if applicable)
+- [ ] Build process completes without errors
+- [ ] Environment variables configured
+- [ ] Documentation updated
+
+## Performance Considerations
+
+### 1. Connection Management
+- Implement proper cleanup for SSE connections
+- Use Map for O(1) connection lookups
+- Set reasonable timeouts
+
+### 2. Memory Management
+- Clean up inactive connections
+- Avoid memory leaks in long-running connections
+- Monitor connection count
+
+## Debugging Tips
+
+### 1. Port Issues
+```bash
+lsof -ti:3000  # Find what's using port
+PORT=8080 npm run dev  # Use alternative port
+```
+
+### 2. SSE Debugging
+```bash
+curl -N http://localhost:PORT/sse | head -5  # Test SSE connection
+```
+
+### 3. TypeScript Issues
+- Ensure proper module resolution
+- Check Node.js types are installed
+- Verify commonjs compatibility
+
+## When NOT to Migrate
+
+Consider staying on Cloudflare Workers when:
+- Heavy use of Durable Objects with complex state
+- Extensive KV Storage integration
+- Edge computing requirements
+- Global distribution needs
+- Complex Workers-specific integrations
+
+## Success Metrics
+
+Migration is successful when:
+- All original functionality preserved
+- Build/deploy process works on DigitalOcean
+- Performance meets requirements
+- Code is more maintainable
+- Documentation is complete
+- Tests pass for all endpoints 
